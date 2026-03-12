@@ -22,7 +22,7 @@ E4M3 conversion policy:
 
 Notes:
   - This stage is purely combinational.
-  - External output width remains p.outputFmt.ieeeWidth (BF16 width = 16).
+  - External output width remains 16 bits (BF16).
     In OutE4M3 mode, the E4M3 value is placed in bits [7:0] and the upper bits are zero.
 */
 
@@ -36,15 +36,12 @@ object OutputFmtSel extends ChiselEnum {
   val OutBF16, OutE4M3 = Value
 }
 
-class BF16ScaleToE4M3(p: InnerProductTreeParams) extends Module {
+class BF16ScaleToE4M3() extends Module {
   val io = IO(new Bundle {
-    val bf16In   = Input(UInt(p.outputFmt.ieeeWidth.W))  // sanitized BF16
+    val bf16In   = Input(UInt(16.W))  // sanitized BF16
     val scaleExp = Input(SInt(8.W))                      // exact power-of-two scale: multiply by 2^scaleExp
-    val e4m3Out  = Output(UInt(p.inputFmt.ieeeWidth.W))  // E4M3
+    val e4m3Out  = Output(UInt(16.W))  // E4M3
   })
-
-  require(p.outputFmt == AtlasFPType.BF16, "BF16ScaleToE4M3 expects BF16 outputFmt")
-  require(p.inputFmt  == AtlasFPType.E4M3, "BF16ScaleToE4M3 expects E4M3 inputFmt")
 
   def packE4M3(sign: UInt, exp: UInt, mant: UInt): UInt =
     Cat(sign(0), exp(3, 0), mant(2, 0))
@@ -121,20 +118,17 @@ class BF16ScaleToE4M3(p: InnerProductTreeParams) extends Module {
   io.e4m3Out := out
 }
 
-class OutputConvStage(p: InnerProductTreeParams) extends Module {
+class OutputConvStage() extends Module {
   val io = IO(new Bundle {
-    val bf16In    = Input(UInt(p.outputFmt.ieeeWidth.W))
+    val bf16In    = Input(UInt(16.W))
     val outFmtSel = Input(OutputFmtSel())
     val scaleExp  = Input(SInt(8.W))
 
     // BF16-width output container:
     //   OutBF16: full 16-bit sanitized BF16
     //   OutE4M3: low 8 bits hold E4M3, upper bits are zero
-    val out       = Output(UInt(p.outputFmt.ieeeWidth.W))
+    val out       = Output(UInt(16.W))
   })
-
-  require(p.outputFmt == AtlasFPType.BF16, "OutputConvStage expects BF16 outputFmt")
-  require(p.inputFmt  == AtlasFPType.E4M3, "OutputConvStage expects E4M3 inputFmt")
 
   val sign     = io.bf16In(15)
   val expBF16  = io.bf16In(14, 7)
@@ -147,7 +141,7 @@ class OutputConvStage(p: InnerProductTreeParams) extends Module {
   val BF16_MAX_POS = "h7f7f".U(16.W)
   val BF16_MAX_NEG = "hff7f".U(16.W)
 
-  val bf16Sanitized = Wire(UInt(p.outputFmt.ieeeWidth.W))
+  val bf16Sanitized = Wire(UInt(16.W))
   bf16Sanitized := io.bf16In
   when(isSub || isNaN) {
     bf16Sanitized := 0.U
@@ -155,12 +149,12 @@ class OutputConvStage(p: InnerProductTreeParams) extends Module {
     bf16Sanitized := Mux(sign.asBool, BF16_MAX_NEG, BF16_MAX_POS)
   }
 
-  val cast = Module(new BF16ScaleToE4M3(p))
+  val cast = Module(new BF16ScaleToE4M3())
   cast.io.bf16In   := bf16Sanitized
   cast.io.scaleExp := io.scaleExp
 
   io.out := bf16Sanitized
   when(io.outFmtSel === OutputFmtSel.OutE4M3) {
-    io.out := Cat(0.U((p.outputFmt.ieeeWidth - p.inputFmt.ieeeWidth).W), cast.io.e4m3Out)
+    io.out := Cat(0.U(8.W), cast.io.e4m3Out)
   }
 }
