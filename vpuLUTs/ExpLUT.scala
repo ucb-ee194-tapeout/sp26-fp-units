@@ -1,25 +1,23 @@
-package atlas.vector
+package sp26FPUnits
 
 import chisel3._
 import chisel3.util._
+import fpex.hardfloat._
+import fpex._
 
-class LogLUT(ports: Int, addrBits: Int, m: Int, n: Int,
-              min: Double = 1.0, max: Double = 2.0) extends Module {
-              // mantissa portion
-
-  // checking bound domain
-  require(min > 0.0, "minimum of log must be positive")
-  
+class ExpLUT(ports: Int, addrBits: Int, m: Int, n: Int,
+            min: Double = 0.0, max: Double = 1.0)
+  extends Module {
   val io = IO(new Bundle {
     val raddr = Input(Vec(ports, UInt(addrBits.W)))
-    val ren   = Input(Vec(ports, Bool()))
+    val ren = Input(Vec(ports, Bool()))
     val rdata = Output(Vec(2, Vec(ports, UInt((m + n).W))))
   })
 
   val entries = 1 << addrBits
   val lut = VecInit.tabulate(entries) { i =>
     val r = min + i.toDouble * (max - min) / entries
-    val v = math.log(r) / math.log(2.0)      // log2(r)
+    val v = math.pow(2.0, r)
     val scaled = BigInt(math.round(v * (1 << n)))
     scaled.U((m + n).W)
   }
@@ -34,5 +32,4 @@ class LogLUT(ports: Int, addrBits: Int, m: Int, n: Int,
     }
   }
   io.rdata := res
-  
 }

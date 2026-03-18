@@ -1,12 +1,9 @@
-package atlas.vector
+package sp26FPUnits
 
 import chisel3._
 import chisel3.util._
-import atlas.common.VPUParams
-// import hardfloat._  //sophia comment: taking this one out bc folder is gone 
 import fpex._
-import sp26FPUnits.hardfloat._
-import sp26FPUnits._
+import hardfloat._
 
 // LUT used for both sin and cos, since we can leverage the identity sin(x) = cos(pi/2 - x)
 class SinCosLUT(ports: Int, addrBits: Int, m: Int, n: Int,

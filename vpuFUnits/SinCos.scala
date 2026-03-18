@@ -1,10 +1,9 @@
-package atlas.vector
+package sp26FPUnits
 
 import chisel3._
 import chisel3.util._
 import fpex.hardfloat._
 import fpex._
-import sp26FPUnits._
 
 trait HasSinCosParams {
     def numFP16Lanes = 16

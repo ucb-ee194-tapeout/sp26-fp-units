@@ -1,11 +1,9 @@
-package atlas.vector
+package sp26FPUnits
 
 import chisel3._
 import chisel3.util._
 import fpex._
-import sp26FPUnits._
-import sp26FPUnits.hardfloat._      
-import sp26FPUnits.hardfloat.consts._
+import hardfloat._      
 
 // Input bundles
 class MaxReduReq(wordWidth: Int, numLanes: Int, tagWidth: Int) extends Bundle {

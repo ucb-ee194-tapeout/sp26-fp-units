@@ -2,6 +2,7 @@ package sp26FPUnits
 
 import chisel3._
 import chisel3.util._
+import fpex._
 
 class Exp2(fptype: FPType) extends Module {
   val w = fptype.wordWidth

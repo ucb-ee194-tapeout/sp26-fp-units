@@ -1,4 +1,4 @@
-package atlas.vector
+package sp26FPUnits
 
 import chisel3._
 import chisel3.util._
