@@ -49,6 +49,18 @@ class SinCos(BF16T: FPType, numLanes: Int = 16, tagWidth: Int = 16) extends Modu
         val resp = Decoupled(new SinCosResp(BF16T.wordWidth, numLanes, tagWidth))
     })
 
+    // Input requirements
+    val zeroBF16  = 0.U(BF16T.wordWidth.W)
+    val twoPiBF16 = "h40C9".U(BF16T.wordWidth.W) // BF16 encoding of ~6.28125
+    for (i <- 0 until numLanes) {
+        when (io.req.fire && io.req.bits.laneMask(i)) {
+            assert(
+                io.req.bits.xVec(i) >= zeroBF16 && io.req.bits.xVec(i) <= twoPiBF16,
+                s"xVec($i) must be in [0, 2pi]"
+            )
+        }
+    }
+
 
     /* Initial setup:
      *  1. Instantiate the LUT
@@ -88,8 +100,6 @@ class SinCos(BF16T: FPType, numLanes: Int = 16, tagWidth: Int = 16) extends Modu
             0.U(BF16T.wordWidth.W),
             Seq(
                 x.isNaN -> Cat(x.sign, BF16T.nanExp, isSigNaNRawFloat(x), BF16T.nanSig),
-                ((x.isZero) && maskedCos) -> BF16T.one,
-                ((x.isZero) && !maskedCos) -> BF16T.zero,
                 (x.isInf) -> Cat(0.U(1.W), BF16T.infinity)
             )
         )
@@ -166,6 +176,7 @@ class SinCos(BF16T: FPType, numLanes: Int = 16, tagWidth: Int = 16) extends Modu
     val k2_over_pi_bf16       = fpTobf((2.0 / Math.PI).toFloat).U(16.W)
     def k2verPi = BF16T.qmnFromRawFloat(rawFloatFromFN(BF16T.expWidth, BF16T.sigWidth, k2_over_pi_bf16))
     val stage2Qmn = maskLaneNext(stage1Qmn, st(1).laneEn, bp(2))
+    val stage2RawFloatVec = maskLaneNext(stage1RawFloatVec, st(1).laneEn, bp(2))
     val krVec = stage2Qmn.map(_.mul(k2verPi).getKR).unzip
     val stage2kVec = VecInit(krVec._1)
     val stage2rVec = VecInit(krVec._2)
@@ -192,6 +203,7 @@ class SinCos(BF16T: FPType, numLanes: Int = 16, tagWidth: Int = 16) extends Modu
      */ 
     val stage3IsCosVec = maskLaneNext(stage2IsCosVec, st(2).laneEn, bp(3))
     val stage3MaskedNeg = maskLaneNext(stage2MaskedNeg, st(2).laneEn, bp(3))
+    val stage3RawFloatVec = maskLaneNext(stage2RawFloatVec, st(2).laneEn, bp(3))
     val stage3kVec = maskLaneNext(stage2kVec, st(2).laneEn, bp(3))
     val stage3rVec = maskLaneNext(stage2rVec, st(2).laneEn, bp(3))
     val stage3AddrVec = VecInit(stage3rVec.map(r => r(BF16T.qmnN - 1, rLowBits)))
@@ -201,8 +213,21 @@ class SinCos(BF16T: FPType, numLanes: Int = 16, tagWidth: Int = 16) extends Modu
     val stage3delta = VecInit(stage3y0.zip(stage3y1).zip(stage3IsCosVec).map { 
         case ((y0, y1), c) => Mux(c, y0 - y1, y1 - y0 )})
     val stage3basey = VecInit(stage3y0.zip(stage3y1).zip(stage3IsCosVec).map{case ((y0, y1), c) => Mux(c, y1, y0)})
+    val stage3earlyResult = VecInit(
+        stage3RawFloatVec.zip(stage3IsCosVec).map { case (x, c) =>
+            MuxCase(
+            0.U(BF16T.wordWidth.W),
+            Seq(
+                x.isNaN -> Cat(x.sign, BF16T.nanExp, isSigNaNRawFloat(x), BF16T.nanSig),
+                x.isInf -> Cat(0.U(1.W), BF16T.infinity),
+                ((x.isZero) && c) -> BF16T.one,
+                // ((x.isZero) && !c) -> BF16T.zero
+            ))
+        }
+    )
 
     // Stage 4: Perform interpolation (i.e. delta * lowbits of qmn)
+    val stage4earlyResult = maskLaneNext(stage3earlyResult, st(3).laneEn, bp(4))
     val stage4MaskedNeg = maskLaneNext(stage3MaskedNeg, st(3).laneEn, bp(4))
     val stage4kVec = maskLaneNext(stage3kVec, st(3).laneEn, bp(4))
     val stage4y0 = maskLaneNext(stage3basey, st(3).laneEn, bp(4))
@@ -213,6 +238,7 @@ class SinCos(BF16T: FPType, numLanes: Int = 16, tagWidth: Int = 16) extends Modu
     })
 
     // Stage 5: add delta * frac to y0
+    val stage5earlyResult = maskLaneNext(stage4earlyResult, st(4).laneEn, bp(5))
     val staged5MaskedNeg = maskLaneNext(stage4MaskedNeg, st(4).laneEn, bp(5))
     val stage5kVec = maskLaneNext(stage4kVec, st(4).laneEn, bp(5))
     val stage5y0 = maskLaneNext(stage4y0, st(4).laneEn, bp(5))
@@ -222,6 +248,7 @@ class SinCos(BF16T: FPType, numLanes: Int = 16, tagWidth: Int = 16) extends Modu
     })
 
     //stage 6: convert and return result
+    val stage6earlyResult = maskLaneNext(stage5earlyResult, st(5).laneEn, bp(6))
     val staged6MaskedNeg = maskLaneNext(staged5MaskedNeg, st(5).laneEn, bp(6))
     val stage6kVec = maskLaneNext(stage5kVec, st(5).laneEn, bp(6))
     val stage6OutputVec = maskLaneNext(stage5OutputVec, st(5).laneEn, bp(6))
@@ -242,7 +269,7 @@ class SinCos(BF16T: FPType, numLanes: Int = 16, tagWidth: Int = 16) extends Modu
     // val resFinal = VecInit(resFN.zip(st(6).earlyTerm.zip(st(6).earlyRes)).map {
     //     case (res, (earlyTerminate, earlyRes)) => Mux(earlyTerminate, earlyRes, res)
     // })
-    val resFinal = VecInit(resFN.zip(st(6).earlyTerm.zip(st(6).earlyRes)).map {
+    val resFinal = VecInit(resFN.zip(st(6).earlyTerm.zip(stage6earlyResult)).map {
         case (res, (earlyTerminate, earlyRes)) =>
             val sign = res(15)
             val exp  = res(14,7)
