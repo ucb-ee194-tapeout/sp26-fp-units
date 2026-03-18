@@ -30,7 +30,6 @@ package sp26FPUnits
 
 import chisel3._
 import chisel3.util._
-import atlas.common.InnerProductTreeParams
 
 object OutputFmtSel extends ChiselEnum {
   val OutBF16, OutE4M3 = Value
