@@ -20,6 +20,143 @@ trait HasSinCosParams {
         require(laneMask.length == bitsVec.length)
         VecInit(bitsVec.zip(laneMask).map{case (bits, en) => RegEnable(bits, en && !bp)})
     }
+
+    def bf16ToQmnTimesTwoOverPi(x: UInt, qmnM: Int = 9, qmnN: Int = 12): SInt = {
+        require(x.getWidth == 16, "bf16ToQmnTimesPiOver2 expects a 16-bit BF16 input")
+
+        val sign = x(15)
+        val exp  = x(14, 7)
+        val frac = x(6, 0)
+
+        val bias = 127
+        val outW = qmnM + qmnN + 1   // signed Q(m,n) width
+
+        val isZero = exp === 0.U && frac === 0.U
+        val isSub  = exp === 0.U && frac =/= 0.U
+        val isInf  = exp === "hff".U && frac === 0.U
+        val isNaN  = exp === "hff".U && frac =/= 0.U
+
+        val maxVal = ((BigInt(1) << (qmnM + qmnN)) - 1).S(outW.W)
+        val minVal = (-(BigInt(1) << (qmnM + qmnN))).S(outW.W)
+
+        // -------------------------
+        // Step 1: BF16 -> Q(m,n)
+        // -------------------------
+        val mant = Cat(1.U(1.W), frac) // 1.frac, scaled by 2^7
+
+        // Q(m,n) integer = mant * 2^(exp-bias+qmnN-7)
+        val shift = (exp.zext - bias.S) + qmnN.S - 7.S
+
+        val shiftedUnsigned = Wire(UInt((qmnM + qmnN + 8).W))
+        shiftedUnsigned := 0.U
+
+        when (shift >= 0.S) {
+            val sh = shift.asUInt
+            shiftedUnsigned := (mant << sh)(qmnM + qmnN + 7, 0)
+        } .otherwise {
+            val rsh = (-shift).asUInt
+            shiftedUnsigned := mant >> rsh
+        }
+
+        val shiftedSigned = shiftedUnsigned.asSInt
+        val qmnVal = Wire(SInt(outW.W))
+        qmnVal := 0.S
+
+        when (isZero || isSub) {
+            qmnVal := 0.S
+        } .elsewhen (isNaN) {
+            qmnVal := 0.S
+        } .elsewhen (isInf) {
+            qmnVal := Mux(sign, minVal, maxVal)
+        } .otherwise {
+            val signedVal = Mux(sign, -shiftedSigned, shiftedSigned)
+
+            when (signedVal > maxVal) {
+                qmnVal := maxVal
+            } .elsewhen (signedVal < minVal) {
+                qmnVal := minVal
+            } .otherwise {
+                qmnVal := signedVal.asTypeOf(SInt(outW.W))
+            }
+        }
+
+        // -------------------------
+        // Step 2: multiply by 2/pi in Q(m,n)
+        // -------------------------
+        val twoOverPiFixed =((BigDecimal(2 / math.Pi) * BigDecimal(BigInt(1) << qmnN)).setScale(0, BigDecimal.RoundingMode.HALF_UP).toBigInt).S(outW.W)
+        val multW = 2 * outW
+        val product = Wire(SInt(multW.W))
+        product := qmnVal * twoOverPiFixed
+
+        // Back to Q(m,n)
+        val scaledProduct = (product >> qmnN).asSInt
+
+        // -------------------------
+        // Step 3: saturate result
+        // -------------------------
+        val result = Wire(SInt(outW.W))
+        result := 0.S
+
+        when (scaledProduct > maxVal) {
+            result := maxVal
+        } .elsewhen (scaledProduct < minVal) {
+            result := minVal
+        } .otherwise {
+            result := scaledProduct(outW - 1, 0).asSInt
+        }
+
+        result
+    }
+
+    def lutFixedToBf16(x: UInt, lutValM: Int = 1, lutValN: Int = 16, neg: Bool = false.B): UInt = {
+        val inW = lutValM + lutValN
+        require(x.getWidth == inW, s"lutFixedToBf16 expects ${inW}-bit UInt input")
+
+        val expW  = 8
+        val fracW = 7
+        val bias  = 127
+
+        val isZero = x === 0.U
+
+        // index of highest 1 bit in x
+        val highestIdx = Wire(UInt(log2Ceil(inW).W))
+        highestIdx := 0.U
+        for (i <- 0 until inW) {
+            when(x(i)) { highestIdx := i.U }
+        }
+
+        // since x represents real_value * 2^lutValN
+        // real exponent = highestIdx - lutValN
+        val unbiasedExp = highestIdx.zext - lutValN.S
+        val bfExpSigned = unbiasedExp + bias.S
+
+        // shift so leading 1 lands in bit 7 of an 8-bit mantissa: [1].[7 frac bits]
+        val shiftAmt = Wire(UInt(log2Ceil(inW + 1).W))
+        shiftAmt := Mux(highestIdx > 7.U, highestIdx - 7.U, 0.U)
+
+        val mantPre = x >> shiftAmt
+        val mant8   = Wire(UInt(8.W))
+        mant8 := mantPre(7, 0)
+
+        val frac = mant8(6, 0)
+
+        val result = Wire(UInt(16.W))
+        result := 0.U
+
+        when(isZero) {
+            result := Cat(neg, 0.U(expW.W), 0.U(fracW.W))
+        } .elsewhen(bfExpSigned <= 0.S) {
+            // flush subnormals/underflow to zero
+            result := Cat(neg, 0.U(expW.W), 0.U(fracW.W))
+        } .elsewhen(bfExpSigned >= 255.S) {
+            // overflow to infinity
+            result := Cat(neg, Fill(expW, 1.U(1.W)), 0.U(fracW.W))
+        } .otherwise {
+            result := Cat(neg, bfExpSigned.asUInt(7, 0), frac)
+        }
+
+        result
+    }
 }
 
 // Input bundles
@@ -48,7 +185,7 @@ class SinCos(BF16T: AtlasFPType, numLanes: Int = 16, tagWidth: Int = 16) extends
         val resp = Decoupled(new SinCosResp(BF16T.wordWidth, numLanes, tagWidth))
     })
 
-    // Input requirements
+    // Input restriciton
     val zeroBF16  = 0.U(BF16T.wordWidth.W)
     val twoPiBF16 = "h40C9".U(BF16T.wordWidth.W) // BF16 encoding of ~6.28125
     for (i <- 0 until numLanes) {
@@ -60,64 +197,43 @@ class SinCos(BF16T: AtlasFPType, numLanes: Int = 16, tagWidth: Int = 16) extends
         }
     }
 
-
-    /* Initial setup:
-     *  1. Instantiate the LUT
-     *  2. Instatntiate the round to recoding modules
-     *  3. Compute the number of bits needed for interpolation multiplication
-     *  4. Compute the top endpoint of the LUT for saturation which is 1 shifted by lutValN
-     *  5. Allow the input data to pass through if the respective lane is enabled
-     *  6. Determine validity of cosine computation
-     *  7. Values for determining quadrants
-    */ 
-    val lut = Module(new SinCosLUT(numLanes, BF16T.lutAddrBits, BF16T.lutValM, BF16T.lutValN))
-    val roundToRecFn = Seq.fill(numLanes)(Module(new RoundRawFNToRecFN(BF16T.expWidth, BF16T.sigWidth, 0)))
+    // Initial Setup
     val rLowBits = BF16T.qmnN - BF16T.lutAddrBits
-    val lutTopEndpoint =(BigInt(1) << BF16T.lutValN).U((BF16T.lutValM + BF16T.lutValN).W)
+    val lut = Module(new SinCosLUT(numLanes, BF16T.lutAddrBits, BF16T.lutValM, BF16T.lutValN))
     val laneEnable = VecInit((io.req.bits.laneMask & VecInit.fill(numLanes)(io.req.fire).asUInt).asBools)
+    val maskedCos = io.req.bits.cos && io.req.fire
     val maskedXVec = io.req.bits.xVec.zip(laneEnable).map {
         case (x, en) => Mux (en, x, 0.U(BF16T.wordWidth.W))
     }
-    val maskedCos = io.req.bits.cos && io.req.fire
-
-    // Storing special angle values in QMN format for quadrant reduction and interpolation
-    def bf16BitsFromFloat(f: Float): UInt =(java.lang.Float.floatToIntBits(f) >>> 16).U(16.W)
-    def fpTobf(f: Float): Int = {
-        val x = java.lang.Float.floatToRawIntBits(f)
-        val lsb = (x >>> 16) & 1
-        val roundingBias = 0x7FFF + lsb
-        ((x + roundingBias) >>> 16) & 0xFFFF
-    }
-
-    /* Stage 0: 
-     * 1. Raw floaw decomposition
-     * 2. Check for special cases (NaN, Inf, zero) and compute early result and early termination signal accordingly
-    */ 
-    val rawFloatVec = VecInit(maskedXVec.map(x => rawFloatFromFN(BF16T.expWidth, BF16T.sigWidth, x)))
-    val earlyResult = VecInit(rawFloatVec.map { x =>
-        MuxCase(
-            0.U(BF16T.wordWidth.W),
-            Seq(
-                x.isNaN -> Cat(x.sign, BF16T.nanExp, isSigNaNRawFloat(x), BF16T.nanSig),
-                (x.isInf) -> Cat(0.U(1.W), BF16T.infinity)
-            )
-        )
-    })
-    val earlyTerminate = VecInit(rawFloatVec.map { x => x.isInf || x.isZero || x.isNaN})
-
-
+    
+    /* Stage 0:
+     *  1. BF16 -> Q(m,n)
+     *  2. Determine sin/cos behavior
+     *  3. Determine otuput sign
+    */
+    val qmnVec = VecInit(maskedXVec.map(x => bf16ToQmnTimesTwoOverPi(x)))
+    val nVec   = VecInit(qmnVec.map(x => x(BF16T.qmnN - 1, 0)))
+    val quadrantBits = VecInit(qmnVec.map(x => x(BF16T.qmnN + 1, BF16T.qmnN)))
+    val isNegVec = VecInit(quadrantBits.map(x => Mux(maskedCos, 
+            Mux(x === 1.U || x === 2.U, true.B, false.B), // Cosine is negative in quadrants 2 and 3
+            Mux(x === 2.U || x === 3.U, true.B, false.B)  // Sine is negative in quadrants 3 and 4
+    ))) 
+    val isCosVec = VecInit(quadrantBits.map(x => Mux(maskedCos, 
+        Mux(x === 0.U || x === 2.U, true.B, false.B), // If cos based, quadrant 1 and 3 behave the same as cos
+        Mux(x === 1.U || x === 3.U, true.B, false.B)  // If sin based, quadrant 2 and 4 behave the same as cos
+    )))
+    
     // States for pipelining
     class CommonStageState extends Bundle {
         val valid = Bool()
         val req = chiselTypeOf(io.req.bits)
         val laneEn = chiselTypeOf(laneEnable)
         val isCos = Bool()
-        val earlyTerm = chiselTypeOf(earlyTerminate)
-        val earlyRes = chiselTypeOf(earlyResult)
+        val qmnNVec = chiselTypeOf(nVec)
     }
 
     // Initializing the states
-    def numIntermediateStages = 6
+    def numIntermediateStages = 1
     val commonState = RegInit(VecInit(Seq.fill(numIntermediateStages)(0.U.asTypeOf(new CommonStageState))))
     val backPressure = Wire(Vec(numIntermediateStages, Bool()))
     val stateWithBp = commonState.zip(backPressure)
@@ -130,169 +246,31 @@ class SinCos(BF16T: AtlasFPType, numLanes: Int = 16, tagWidth: Int = 16) extends
         state.req := Mux(io.req.fire, io.req.bits, state.req)
         state.laneEn := Mux(!back, laneEnable, state.laneEn)
         state.isCos := Mux(io.req.fire, maskedCos, state.isCos)
-        state.earlyTerm := maskLane(state.earlyTerm, earlyTerminate, laneEnable, back)
-        state.earlyRes := maskLane(state.earlyRes, earlyResult, laneEnable, back)
+        state.qmnNVec := maskLane(state.qmnNVec, nVec, laneEnable, back)
     }
-
-    // Assigning values to the rest of the stages: if not back pressured, take value from previous stage; if back pressured, hold current value.
-    stateWithBp.zipWithIndex.takeRight(numIntermediateStages - 1).foreach {
-        case ((state, back), i) =>
-        state.valid := Mux(!back, st(i).valid, state.valid)
-        state.req := Mux(st(i).valid && !back, st(i).req, state.req)
-        state.laneEn := Mux(!back, st(i).laneEn, state.laneEn)
-        state.isCos := Mux(st(i).valid && !back, st(i).isCos, state.isCos)
-        state.earlyTerm := maskLane(state.earlyTerm, st(i).earlyTerm, st(i).laneEn, back)
-        state.earlyRes := maskLane(state.earlyRes, st(i).earlyRes, st(i).laneEn, back)
-    }
-
-    /* Assigning backpressure: 
-     * Last stage is back pressured if response is not ready.
-     * Current stage is back pressured if it is valid and the next stage is back pressured. 
-     */ 
     backPressure(numIntermediateStages-1) := !io.resp.ready
-    backPressure.zip(commonState).zipWithIndex.take(numIntermediateStages-1).foreach { case ((bp, st), i) =>
-        bp := st.valid && backPressure(i+1)
-    }
-    
-    
-    /* Stage 1:
-     * 1. Pasing input from stage 0 to stage 1 based on backpressure and lane enable
-     * 2. Raw float to qmn conversion
-     * 3. Determine the quadrant for each input and the sign of sine and cosine based on the quadrant
-     */  
-    val stage1RawFloatVec = maskLaneNext(rawFloatVec, laneEnable, bp(1))
-    val stage1Qmn = VecInit(stage1RawFloatVec.map(x => BF16T.qmnFromRawFloat(x)))
-    
 
-    /* Stage 2: 
-     * 1. Passing qmn and quadrant info from stage 1 to stage 2 based on backpressure and lane enable
-     * 2. Reducing qmn to the first quadrant based on the quadrant info 
-     * 3. Taking the integer bits and the sig bits of the reduced qmn for LUT indexing and interpolation respectively
-     * 4. Indexing into the LUT with the (sig - lowBits) bits and requesting the data when valid and not back pressured
-     * 5. Determining the sign of the output and cos/sin based on the quadrant information
-     * 6. Assigning inputs to the LUT
-     */  
-    val k2_over_pi_bf16       = fpTobf((2.0 / Math.PI).toFloat).U(16.W)
-    def k2verPi = BF16T.qmnFromRawFloat(rawFloatFromFN(BF16T.expWidth, BF16T.sigWidth, k2_over_pi_bf16))
-    val stage2Qmn = maskLaneNext(stage1Qmn, st(1).laneEn, bp(2))
-    val stage2RawFloatVec = maskLaneNext(stage1RawFloatVec, st(1).laneEn, bp(2))
-    val krVec = stage2Qmn.map(_.mul(k2verPi).getKR).unzip
-    val stage2kVec = VecInit(krVec._1)
-    val stage2rVec = VecInit(krVec._2)
-    val stage2MaskedNeg = VecInit(stage2kVec.map { q => Mux(st(2).isCos, 
-            Mux(q(1,0) === 1.U || q(1,0) === 2.U, true.B, false.B), // Cosine is negative in quadrants 2 and 3
-            Mux(q(1,0) === 2.U || q(1,0) === 3.U, true.B, false.B)  // Sine is negative in quadrants 3 and 4
-        )
-    })
-    val stage2IsCosVec = VecInit(stage2kVec.map(q => Mux(st(2).isCos, 
-        Mux(q(1,0) === 0.U || q(1,0) === 2.U, true.B, false.B), // If cos based, quadrant 1 and 3 behave the same as cos
-        Mux(q(1,0) === 1.U || q(1,0) === 3.U, true.B, false.B)  // If sin based, quadrant 2 and 4 behave the same as cos
-    )))
+    lut.io.raddr := nVec.map(r => r(BF16T.qmnN - 1, rLowBits))
+    lut.io.ren := VecInit(laneEnable.map(en => en && io.req.fire && !bp(1)))
+    lut.io.isCos := isCosVec
 
-    lut.io.raddr := stage2rVec.map(r => r(BF16T.qmnN - 1, rLowBits))
-    lut.io.ren := VecInit(st(2).laneEn.map(en => en && st(2).valid && !bp(3)))
-    lut.io.isCos := stage2IsCosVec
-
-    /* Stage 3: 
-     * 1. Passing necessary signals to stage 3 based on backpressure and lane enable
-     * 2. Calculate the address for LUT and the lower bits of r for interpolation
-     * 3. Output from LUT is ready
-     * 4. Calcualte delta for interpolation
-     * 5. Initalize the true base value from LUT output for interpolation which is y0 for sine and y1 for cosine
-     */ 
-    val stage3IsCosVec = maskLaneNext(stage2IsCosVec, st(2).laneEn, bp(3))
-    val stage3MaskedNeg = maskLaneNext(stage2MaskedNeg, st(2).laneEn, bp(3))
-    val stage3RawFloatVec = maskLaneNext(stage2RawFloatVec, st(2).laneEn, bp(3))
-    val stage3kVec = maskLaneNext(stage2kVec, st(2).laneEn, bp(3))
-    val stage3rVec = maskLaneNext(stage2rVec, st(2).laneEn, bp(3))
-    val stage3AddrVec = VecInit(stage3rVec.map(r => r(BF16T.qmnN - 1, rLowBits)))
-    val stage3rLowerVec = VecInit(stage3rVec.zip(stage3IsCosVec).map{case(r, c) => Mux(c, (1 << rLowBits).U - r(rLowBits-1, 0), r(rLowBits-1, 0))})  
-    val stage3y0 = lut.io.rdata(0)
-    val stage3y1 = lut.io.rdata(1)
-    val stage3delta = VecInit(stage3y0.zip(stage3y1).zip(stage3IsCosVec).map { 
+    /* Stage 1: Interpolation */
+    val stage1MaskedNeg = maskLaneNext(isNegVec, laneEnable, bp(1))
+    val stage1IsCosVec = maskLaneNext(isCosVec, laneEnable, bp(1))
+    val stage1rLowerVec = VecInit(st(1).qmnNVec.zip(stage1IsCosVec).map{case(r, c) => Mux(c, (1 << rLowBits).U - r(rLowBits-1, 0), r(rLowBits-1, 0))})  
+    val y0Vec = lut.io.rdata(0)
+    val y1Vec = lut.io.rdata(1)
+    val delta = VecInit(y0Vec.zip(y1Vec).zip(stage1IsCosVec).map { 
         case ((y0, y1), c) => Mux(c, y0 - y1, y1 - y0 )})
-    val stage3basey = VecInit(stage3y0.zip(stage3y1).zip(stage3IsCosVec).map{case ((y0, y1), c) => Mux(c, y1, y0)})
-    val stage3earlyResult = VecInit(
-        stage3RawFloatVec.zip(stage3IsCosVec).map { case (x, c) =>
-            MuxCase(
-            0.U(BF16T.wordWidth.W),
-            Seq(
-                x.isNaN -> Cat(x.sign, BF16T.nanExp, isSigNaNRawFloat(x), BF16T.nanSig),
-                x.isInf -> Cat(0.U(1.W), BF16T.infinity),
-                ((x.isZero) && c) -> BF16T.one,
-                // ((x.isZero) && !c) -> BF16T.zero
-            ))
-        }
-    )
-
-    // Stage 4: Perform interpolation (i.e. delta * lowbits of qmn)
-    val stage4earlyResult = maskLaneNext(stage3earlyResult, st(3).laneEn, bp(4))
-    val stage4MaskedNeg = maskLaneNext(stage3MaskedNeg, st(3).laneEn, bp(4))
-    val stage4kVec = maskLaneNext(stage3kVec, st(3).laneEn, bp(4))
-    val stage4y0 = maskLaneNext(stage3basey, st(3).laneEn, bp(4))
-    val stage4delta = maskLaneNext(stage3delta, st(3).laneEn, bp(4))
-    val stage4frac = maskLaneNext(stage3rLowerVec, st(3).laneEn, bp(4))
-    val stage4deltaFrac = VecInit(stage4delta.zip(stage4frac).map {
-        case (delta, frac) => (delta * frac) >> rLowBits
+    val basey = VecInit(y0Vec.zip(y1Vec).zip(stage1IsCosVec).map{case ((y0, y1), c) => Mux(c, y1, y0)})
+    val resultLutFixed = VecInit(delta.zip(stage1rLowerVec).zip(basey).map { case ((d, frac), y) =>
+        val interp = ((d * frac) >> rLowBits) + y
+        interp(BF16T.lutValM + BF16T.lutValN - 1, 0)
     })
-
-    // Stage 5: add delta * frac to y0
-    val stage5earlyResult = maskLaneNext(stage4earlyResult, st(4).laneEn, bp(5))
-    val staged5MaskedNeg = maskLaneNext(stage4MaskedNeg, st(4).laneEn, bp(5))
-    val stage5kVec = maskLaneNext(stage4kVec, st(4).laneEn, bp(5))
-    val stage5y0 = maskLaneNext(stage4y0, st(4).laneEn, bp(5))
-    val stage5deltaFrac = maskLaneNext(stage4deltaFrac, st(4).laneEn, bp(5))
-    val stage5OutputVec = VecInit(stage5y0.zip(stage5deltaFrac).map {
-        case (y0, deltaFrac) => y0 + deltaFrac
-    })
-
-    //stage 6: convert and return result
-    val stage6earlyResult = maskLaneNext(stage5earlyResult, st(5).laneEn, bp(6))
-    val staged6MaskedNeg = maskLaneNext(staged5MaskedNeg, st(5).laneEn, bp(6))
-    val stage6kVec = maskLaneNext(stage5kVec, st(5).laneEn, bp(6))
-    val stage6OutputVec = maskLaneNext(stage5OutputVec, st(5).laneEn, bp(6))
-    val resRawFloat = stage6OutputVec.zip(stage6kVec).zip(staged6MaskedNeg).map{ case ((qmn, k), n) => BF16T.rawFloatFromQmnK(qmn, 0.S).negate(n) }
-    // val resRawFloat = stage6OutputVec.map(q => BF16T.rawFloatFromQmnK(q, 0.S))
-    roundToRecFn.zip(resRawFloat).zip(st(6).laneEn).foreach {
-        case ((round, rawFloat), en) => {
-            round.io.invalidExc := false.B
-            round.io.infiniteExc := false.B
-            round.io.in := rawFloat
-            round.io.roundingMode := Mux(en, st(6).req.roundingMode, 0.U)
-            round.io.detectTininess := 0.U
-        }
-    }
-    val resValid = st(6).valid
-    val resReq = st(6).req
-    val resFN = roundToRecFn.map(round => fNFromRecFN(BF16T.expWidth, BF16T.sigWidth, round.io.out))
-    // val resFinal = VecInit(resFN.zip(st(6).earlyTerm.zip(st(6).earlyRes)).map {
-    //     case (res, (earlyTerminate, earlyRes)) => Mux(earlyTerminate, earlyRes, res)
-    // })
-    val resFinal = VecInit(resFN.zip(st(6).earlyTerm.zip(stage6earlyResult)).map {
-        case (res, (earlyTerminate, earlyRes)) =>
-            val sign = res(15)
-            val exp  = res(14,7)
-            val frac = res(6,0)
-
-            val doSub1 = (exp === 127.U)
-            val isZero = (frac === 0.U)
-
-            val leadingzero  = PriorityEncoder(Reverse(frac)) 
-            val shiftNum  = leadingzero + 1.U   
-
-            val expOut = 126.S - leadingzero.zext.asSInt
-            val fracOut = (frac << shiftNum)(6,0)
-
-            val subtracted1 =
-            Mux(isZero,
-                Cat(sign, 0.U(8.W), 0.U(7.W)),        // 1.0 - 1.0 = 0
-                Cat(sign, expOut, fracOut)
-            )
-
-            val out = Mux(doSub1, subtracted1, res)
-
-            Mux(earlyTerminate, earlyRes, out)
-    })
+    val resultBF16 = VecInit(resultLutFixed.map(x => lutFixedToBf16(x, BF16T.lutValM, BF16T.lutValN)))
+    val resultFinal = VecInit(resultBF16.zip(stage1MaskedNeg).map{case (x, c) => Mux(c, Cat(1.U, x(14,0)), x)})
+    val resValid = st(1).valid
+    val resReq = st(1).req
 
     // Output signals
     io.req.ready := !backPressure(0)
@@ -300,38 +278,6 @@ class SinCos(BF16T: AtlasFPType, numLanes: Int = 16, tagWidth: Int = 16) extends
     io.resp.bits.tag := resReq.tag
     io.resp.bits.whichBank := resReq.whichBank
     io.resp.bits.wRow := resReq.wRow
-    io.resp.bits.result := resFinal
+    io.resp.bits.result := resultFinal
     io.resp.bits.laneMask := resReq.laneMask
-
-
-
-    // Debugging
-    // Debugging
-    // Debugging
-    // Input Stage
-    
-    // Stage 0
-
-    // Stage 1
-
-    // // Stage 2
-    // val kval = IO(Output(Vec(numLanes, SInt(18.W))))
-    // val addr = IO(Output(Vec(numLanes, UInt(18.W))))
-    // // Stage 3
-    // val d_stage3y0 = IO(Output(Vec(numLanes, UInt(18.W))))
-    // val d_stage3y1 = IO(Output(Vec(numLanes, UInt(18.W))))
-    // val d_stage3delta = IO(Output(Vec(numLanes, UInt(32.W))))
-    
-
-    // // Stage 4 
-
-    // for (i <- 0 until numLanes) {
-    //     kval(i) := stage2kVec(i)
-    //     addr(i) := lut.io.raddr(i)
-
-    //     d_stage3y0(i) := stage3y0(i)
-    //     d_stage3y1(i) := stage3y1(i)
-    //     d_stage3delta(i) := stage3delta(i)
-
-    // }
 }
