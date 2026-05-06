@@ -6,7 +6,6 @@ BF16 IEEE:   S(1) E(8, bias=127) M(7) = 16 bits
 
 Clean ML contract: no NaN, Inf, subnormals.
 Overflow: clamp to max finite BF16.
-Underflow: flush to zero.
 Rounding: round-to-nearest-even.
 */
 
@@ -83,7 +82,7 @@ class E4M3ProdAddBF16 extends Module {
   // 9. Normalize - subtraction (leading zeros)
   val lzc = PriorityEncoder(Reverse(sigAfterAddNorm))
   val needLeftShift = (!carryOut) && (!sigAfterAddNorm(SIG11 - 1))
-  val leftShiftAmt = Mux(needLeftShift, Mux((lzc > eAfterAddNorm), eAfterAddNorm, lzc), 0.U)
+  val leftShiftAmt = Mux(needLeftShift, Mux(lzc > eAfterAddNorm, eAfterAddNorm(3, 0), lzc), 0.U(4.W))
   val sigNorm = Mux(needLeftShift, (sigAfterAddNorm << leftShiftAmt)(SIG11 - 1, 0), sigAfterAddNorm)
   val eNorm = eAfterAddNorm - leftShiftAmt
 
@@ -99,11 +98,10 @@ class E4M3ProdAddBF16 extends Module {
   val mantissaOut = Mux(roundOverflow, 0.U(7.W), mantissaRounded(6, 0))
   val eRounded = Mux(roundOverflow, eNorm + 1.U, eNorm)
 
-  // 11. Overflow/underflow clamp
-  val underflow = (eNorm <= 0.U)
+  // 11. Overflow clamp (underflow unreachable: pExp8 >= 115, leftShiftAmt <= 10)
   val overflow = (eRounded > 254.U)
-  val eOut = Mux(overflow, 254.U, Mux(underflow, 0.U, eRounded(7, 0)))
-  val mOut = Mux(overflow, 0x7F.U(7.W), Mux(underflow, 0.U(7.W), mantissaOut))
+  val eOut = Mux(overflow, 254.U, eRounded(7, 0))
+  val mOut = Mux(overflow, 0x7F.U(7.W), mantissaOut)
 
   // 12. Output mux
   io.out16 := Mux(pZero, outWhenPZero,
