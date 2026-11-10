@@ -52,8 +52,8 @@ class SinCosLUT(ports: Int, addrBits: Int, m: Int, n: Int,
     //     case ((result, raddr), en) => when (en) { result := lut(raddr) }
     //     }
     // }
-    res(0).zip(raddrReal).zip(is_cos_bot_addr).foreach { case ((r, addr), cb) => r := Mux(cb, scaled, lut(addr))}   
-    res(1).zip(raddrNxt).zip(is_sin_top_addr).foreach { case ((r, addr), st) => r := Mux(st, scaled, lut(addr))}
+    res(0).zip(raddrReal).zip(is_cos_bot_addr).zip(io.ren).foreach { case (((r, addr), cb), en) => when (en) { r := Mux(cb, scaled, lut(addr)) } }   
+    res(1).zip(raddrNxt).zip(is_sin_top_addr).zip(io.ren).foreach { case (((r, addr), st), en) => when (en) { r := Mux(st, scaled, lut(addr)) } }
 
     io.rdata := res
 }
