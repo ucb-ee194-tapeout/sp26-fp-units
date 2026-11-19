@@ -103,7 +103,7 @@ class BF16ScaleToE4M3() extends Module {
       normMant := 0.U
     }
 
-    when(finalUnbExp > 8.S) {
+    when(finalUnbExp > 8.S || (finalUnbExp === 8.S && normMant === 7.U)) {
       out := Mux(sign.asBool, E4M3_MAX_NEG, E4M3_MAX_POS)
     } .elsewhen(finalUnbExp >= (-6).S) {
       val expE4Wide = Wire(UInt(5.W))
